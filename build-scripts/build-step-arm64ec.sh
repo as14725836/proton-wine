@@ -270,6 +270,73 @@ do
     echo "----------------------------------------"
     echo "Done applying patches."
 
+    # ============================================================
+    # 修复 Termux 路径问题 (将 /tmp 替换为 Termux TMPDIR)
+    # ============================================================
+    echo "========================================"
+    echo "修复 Termux 路径问题..."
+    echo "将 /tmp/ 替换为 /data/data/com.termux/files/usr/tmp/"
+    echo "========================================"
+
+    # 1. 替换所有源文件中的 /tmp/ 路径
+    echo "  [1/6] 替换所有 .c .h .in .spec 文件中的 /tmp/ ..."
+    find . -type f \( -name "*.c" -o -name "*.h" -o -name "*.in" -o -name "*.spec" \) \
+        -exec grep -l "/tmp/" {} \; 2>/dev/null | \
+        while read -r file; do
+            sed -i 's|/tmp/|/data/data/com.termux/files/usr/tmp/|g' "$file" 2>/dev/null || true
+        done
+    echo "  [1/6] 完成"
+
+    # 2. 替换 server 目录中的硬编码 "/tmp"
+    echo "  [2/6] 修复 server/ 目录..."
+    find server -type f \( -name "*.c" -o -name "*.h" \) \
+        -exec sed -i 's|"/tmp"|"/data/data/com.termux/files/usr/tmp"|g' {} + 2>/dev/null || true
+    echo "  [2/6] 完成"
+
+    # 3. 替换 file.c 中的 /tmp
+    echo "  [3/6] 修复 file.c ..."
+    find . -name "file.c" \
+        -exec sed -i 's|"/tmp"|"/data/data/com.termux/files/usr/tmp"|g' {} + 2>/dev/null || true
+    echo "  [3/6] 完成"
+
+    # 4. 替换 loader.c 中的 /tmp
+    echo "  [4/6] 修复 loader.c ..."
+    find . -name "loader.c" \
+        -exec sed -i 's|"/tmp"|"/data/data/com.termux/files/usr/tmp"|g' {} + 2>/dev/null || true
+    echo "  [4/6] 完成"
+
+    # 5. 替换 server.c 中的 /tmp
+    echo "  [5/6] 修复 server.c ..."
+    find . -name "server.c" \
+        -exec sed -i 's|"/tmp"|"/data/data/com.termux/files/usr/tmp"|g' {} + 2>/dev/null || true
+    echo "  [5/6] 完成"
+
+    # 6. 替换 dlls 目录中的 /tmp
+    echo "  [6/6] 修复 dlls/ 目录..."
+    find dlls -type f -name "*.c" \
+        -exec grep -l "/tmp" {} \; 2>/dev/null | \
+        while read -r file; do
+            sed -i 's|/tmp/|/data/data/com.termux/files/usr/tmp/|g' "$file" 2>/dev/null || true
+            sed -i 's|"/tmp"|"/data/data/com.termux/files/usr/tmp"|g' "$file" 2>/dev/null || true
+        done
+    echo "  [6/6] 完成"
+
+    # 7. 额外：替换 programs 目录
+    echo "  [7/7] 修复 programs/ 目录..."
+    find programs -type f -name "*.c" \
+        -exec grep -l "/tmp" {} \; 2>/dev/null | \
+        while read -r file; do
+            sed -i 's|/tmp/|/data/data/com.termux/files/usr/tmp/|g' "$file" 2>/dev/null || true
+            sed -i 's|"/tmp"|"/data/data/com.termux/files/usr/tmp"|g' "$file" 2>/dev/null || true
+        done
+    echo "  [7/7] 完成"
+
+    echo "========================================"
+    echo "Termux 路径修复完成！"
+    echo "所有 /tmp 引用已替换为:"
+    echo "/data/data/com.termux/files/usr/tmp/"
+    echo "========================================"
+
     # ---------------------------------------------------------------------
     # HARD post-apply verification.
     # The apply loop above is fail-SOFT: a drifted patch is reported "SKIPPED"
