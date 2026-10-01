@@ -1741,6 +1741,49 @@ done:
  * Load the builtin dll if specified by load order configuration.
  * Return STATUS_IMAGE_ALREADY_LOADED if we should keep the native one that we have found.
  */
+/* Modules whose builtin has to win over a plain x64 file found next to a game's .exe.
+ *
+ * The lookup below starts from the machine of the file that was found, so such a file sends it to
+ * get_pe_dir(IMAGE_FILE_MACHINE_AMD64) = "/x86_64-windows" - a directory an arm64ec build does not
+ * have at all, since every builtin here lives in the arm64ec one. The builtin can then never
+ * replace that file, whatever the load order says. For nearly every module that is the right
+ * answer anyway: a game ships its own dxgi, opengl32, winmm or dinput8 precisely to wrap them, and
+ * those copies must keep winning. This list is only for the ones whose shipped copy cannot do
+ * anything useful on this hardware, so that letting it win is the same as having no DLL at all.
+ *
+ *   amd_ags_x64  AMD's GPU Services. A game's copy reaches the AMD driver through ADL2/atiadlxx
+ *                and imports nothing from DXGI, so on a non-AMD GPU it reports no display
+ *                whatsoever - and a title that asks AGS about its screen is told there is none,
+ *                which is how an in-game HDR option ends up greyed out with no way to turn it on.
+ *                The builtin answers the same questions from DXGI instead. This is not new
+ *                behaviour: it is what x86_64 Proton already does, where the directory exists and
+ *                the builtin is found without any of this.
+ *
+ * A container that wants the shipped copy back sets the DLL override to native, which returns
+ * above before any of this runs.
+ */
+static BOOL arm64ec_builtin_must_win( const UNICODE_STRING *nt_name )
+{
+    static const WCHAR amd_ags_x64W[] = {'a','m','d','_','a','g','s','_','x','6','4','.','d','l','l',0};
+    static const WCHAR *const names[] = { amd_ags_x64W };
+
+    const WCHAR *base = nt_name->Buffer, *p;
+    unsigned int i, len = nt_name->Length / sizeof(WCHAR);
+
+    for (p = nt_name->Buffer; p < nt_name->Buffer + len; p++)
+        if (*p == '\\' || *p == '/') base = p + 1;
+    len -= base - nt_name->Buffer;
+
+    for (i = 0; i < ARRAY_SIZE(names); i++)
+    {
+        unsigned int name_len = wcslen( names[i] );
+
+        if (len == name_len && !wcsnicmp( base, names[i], name_len )) return TRUE;
+    }
+    return FALSE;
+}
+
+
 NTSTATUS load_builtin( const struct pe_image_info *image_info, UNICODE_STRING *nt_name,
                        ANSI_STRING *exp_name, USHORT machine, SECTION_IMAGE_INFORMATION *info,
                        void **module, SIZE_T *size, ULONG_PTR limit_low, ULONG_PTR limit_high,
@@ -1764,8 +1807,25 @@ NTSTATUS load_builtin( const struct pe_image_info *image_info, UNICODE_STRING *n
         loadorder = LO_BUILTIN;  /* builtin with no fallback since mapping a fake dll is not useful */
     }
 
-    if (is_arm64ec() && image_info->is_hybrid && search_machine == IMAGE_FILE_MACHINE_AMD64)
-        search_machine = current_machine;
+    if (is_arm64ec() && search_machine == IMAGE_FILE_MACHINE_AMD64)
+    {
+        /* An arm64ec build has no x86_64-windows directory at all: every builtin lives in the
+         * arm64ec one, including the modules that are themselves x64 code. So when the file we
+         * found is a plain x64 PE - which is what a game ships next to its .exe - this lookup goes
+         * to a directory that does not exist, and no builtin can replace that file however the
+         * load order is set. The same builtin loads without trouble when it is reached through the
+         * copy in system32, because that copy is an arm64ec image and the search starts from its
+         * machine instead; the two paths disagree about where to look.
+         *
+         * Follow the current machine for a hybrid image as before, whenever the load order names
+         * the builtin explicitly so that an override can be honoured, and for the few modules
+         * whose shipped copy cannot work here at all (see arm64ec_builtin_must_win). The default
+         * order is otherwise left alone: redirecting it wholesale would let builtins start
+         * shadowing every x64 dxgi/opengl32/winmm/xinput wrapper that ships beside a game. */
+        if (image_info->is_hybrid || loadorder == LO_BUILTIN || loadorder == LO_BUILTIN_NATIVE ||
+            arm64ec_builtin_must_win( nt_name ))
+            search_machine = current_machine;
+    }
 
     switch (loadorder)
     {

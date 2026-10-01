@@ -1161,6 +1161,28 @@ static int use_lsteamclient(void)
     return use;
 }
 
+/* lsteamclient redirect opt-in. Stock Proton redirects every steamclient(64) /
+ * gameoverlayrenderer(64) image to lsteamclient.dll whenever that builtin can be loaded,
+ * unless PROTON_DISABLE_LSTEAMCLIENT is set. On Android the layer ships lsteamclient for
+ * one launch mode only (a native Steam host outside Wine), while the default launch modes
+ * rely on their own PE steamclient (Valve's, or a Goldberg/gbe one) staying unredirected.
+ * So the redirect in build_module() additionally requires WINE_LSTEAMCLIENT to be set to
+ * something other than "0". Unset: no redirect and lsteamclient.dll is never loaded, i.e.
+ * the same result as a layer without lsteamclient. use_lsteamclient() and the import_dll()
+ * tier0/vstdlib rewrite keep their stock PROTON_DISABLE_LSTEAMCLIENT semantics. */
+static int lsteamclient_opted_in(void)
+{
+    WCHAR env[16];
+    static int opt_in = -1;
+
+    if (opt_in != -1) return opt_in;
+
+    opt_in = get_env( L"WINE_LSTEAMCLIENT", env, sizeof(env) ) && env[0] && env[0] != '0';
+    if (opt_in)
+        TRACE("lsteamclient redirect enabled (WINE_LSTEAMCLIENT).\n");
+    return opt_in;
+}
+
 /*************************************************************************
  *		import_dll
  *
@@ -2374,7 +2396,7 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
     basename_len = wcslen(basename);
     if (basename_len >= 4 && !wcscmp(basename + basename_len - 4, L".dll")) basename_len -= 4;
 
-    if (use_lsteamclient() && ((is_steamclient32 = !RtlCompareUnicodeStrings(basename, basename_len, L"steamclient", 11, TRUE)) ||
+    if (use_lsteamclient() && lsteamclient_opted_in() && ((is_steamclient32 = !RtlCompareUnicodeStrings(basename, basename_len, L"steamclient", 11, TRUE)) ||
          !RtlCompareUnicodeStrings(basename, basename_len, L"steamclient64", 13, TRUE) ||
          !RtlCompareUnicodeStrings(basename, basename_len, L"gameoverlayrenderer", 19, TRUE) ||
          !RtlCompareUnicodeStrings(basename, basename_len, L"gameoverlayrenderer64", 21, TRUE)) &&

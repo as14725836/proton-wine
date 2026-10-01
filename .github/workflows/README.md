@@ -1,147 +1,65 @@
-# Proton Wine Build Workflow
+# Layer build workflow
 
-This GitHub Actions workflow automatically builds Proton Wine for both x86_64 and aarch64 (ARM64EC) architectures.
+Each layer branch carries exactly one build workflow, named for the layer it builds:
 
-## Workflow Overview
+| branch | workflow file | layer |
+|---|---|---|
+| `proton_10.0` | `build-proton-10.0-4.yml` | Proton 10.0-4 |
+| `proton_10.34-GE` | `build-ge-proton-10.0-34.yml` | GE-Proton 10.0-34 |
+| `proton_11.0` | `build-proton-11.0-1.yml` | Proton 11.0-1 |
+| `proton_11.0-2` | `build-proton-11.0-2.yml` | Proton 11.0-2 (arm64ec + x86_64) |
+| `proton_11.3-GE` | `build-ge-proton-11.0-3.yml` | GE-Proton 11.0-3 |
+| `proton_11.5-GE` | `build-ge-proton-11.0-5.yml` | GE-Proton 11.0-5 |
+| `proton_11.6-GE` | `build-ge-proton-11.0-6.yml` | GE-Proton 11.0-6 |
 
-The workflow consists of two main jobs:
+The file name is distinct per branch on purpose: GitHub labels a run with the
+workflow name taken from the default branch's copy of the same path, so a shared
+`build-proton.yml` made every layer's run read as the default branch's layer.
 
-### 1. Build Job (Matrix Strategy)
-Builds Proton Wine for both architectures in parallel:
-- **x86_64**: Intel/AMD 64-bit architecture
-- **aarch64**: ARM64EC architecture
+## How a build is triggered
 
-### 2. Release Job
-Combines all build artifacts and creates a GitHub release (only on push to main/master branch).
+`workflow_dispatch` only works for workflows on the default branch, so layer
+builds are push-triggered. Each workflow fires on a push to its own parent
+branch and to `staging/<parent>/**`. Work on a layer therefore goes:
 
-## Build Process
+1. branch `staging/<parent>/<topic>` off the parent;
+2. push — the run appears under the layer's own workflow name with `run-name`
+   `<Layer> — staging/<parent>/<topic> (push)`;
+3. once green, fast-forward the parent to the staging tip.
 
-The build follows these steps for each architecture:
+Releases are cut separately (`gh release create` with the verified artifacts);
+the `release:` job in each workflow is hard-disabled (`if: false`).
 
-1. **Environment Setup**
-   - Frees up disk space by removing unnecessary tools
-   - Installs required build dependencies
-   - Downloads architecture-specific termuxfs from [GameNative/termux-on-gha](https://github.com/GameNative/termux-on-gha/releases/tag/build-20260218)
+## What a run does
 
-2. **Toolchain Setup** (with caching)
-   - Android NDK r27d (version 27.3.13750724)
-   - LLVM MinGW toolchain (20250920)
+1. termuxfs sysroot, NDK r27d, bylaws llvm-mingw toolchain, cached wine-tools
+   and ccache;
+2. `build-step-<arch>.sh --configure` — fail-hard: configure error, missing or
+   non-applying Android patch, or a missing source marker for any shipped
+   feature stops the build (see the `MARKERS` table in the script);
+   on GE branches `apply-ge-patches.sh` then applies the game-fixes tier with
+   one registered marker per patch;
+3. `--build`, `--install` — fail-hard;
+4. `verify-layer.py` on the installed tree — tree shape, 16 KB page alignment,
+   Android API level, the compiled feature strings, RtlIsEcCode guard bytes,
+   font-handle cap, XP desktop markers in both PE arches, DirectAudio 3-file
+   set, GE strings;
+5. prefixPack.txz downloaded from a pinned GameNative/bionic-prefix-files
+   commit and sha256-checked;
+6. profile.json generated, `.wcp` (zstd) and `.wcp.xz` packaged;
+7. the packaged archives checked (required entries, profile.json byte-identical
+   to the generated one);
+8. artifacts uploaded (30-day retention).
 
-3. **Wine Tools Build** (with caching)
-   - Builds native wine-tools using `build-step0.sh`
-   - Cached based on configure files hash
+## Matrix
 
-4. **Architecture-Specific Build**
-   - Builds sysvshm library (aarch64 only)
-   - Configures build with appropriate flags
-   - Compiles Proton Wine
-   - Installs to output directory
+`arch` × `api_level`. Every leg compiles against the android28 NDK target;
+`api_level: 35` only adds 16 KB linker alignment (`--enable-16kb-pages`).
+arm64ec is always built 16 KB-aligned on api 28. `proton_11.0-2` also builds
+x86_64 (4 KB and 16 KB legs); the other branches are arm64ec-only.
 
-5. **Artifact Packaging**
-   - Copy the correct `prefixPack.txz` from the folder `android`
-   - Generates two `profile.json` files with build metadata:
-     - `profile.json` - Proton type for GameNative
-     - `profile-wine.json` - Wine type for Winlator for CMOD & Ludashi
-   - Creates two output files:
-     - **Proton WCP**: Contains Proton-type profile for GameNative (wcp format)
-     - **Wine WCP**: Contains Wine-type profile for Winlator for CMOD & Ludashi (wcp.xz format)
-   - Each WCP contains:
-     - `bin/` - Wine binaries
-     - `lib/` - Wine libraries
-     - `share/` - Wine data files
-     - `prefixPack.txz` - Bionic prefix files
-     - `profile.json` - Build metadata (type varies)
+## versionCode
 
-## Triggers
-
-The workflow runs on:
-- **Push** to `main`, `master`, or `proton_11.0` branch
-- **Pull requests** to `main`, `master`, or `proton_11.0` branch
-- **Manual trigger** via workflow_dispatch
-
-## Caching Strategy
-
-To speed up builds, the workflow caches:
-- Android NDK (key: `android-ndk-r27d`)
-- LLVM MinGW toolchain (key: `bylaws-llvm-mingw-20250920`)
-- Wine tools (key: `wine-tools-<hash of configure files>`)
-
-## Artifacts
-
-Build artifacts are:
-- Uploaded to GitHub Actions artifacts (30-day retention)
-- Included in GitHub releases (for pushes to main/master/proton_11.0)
-
-### Artifact Names
-
-**Output Files**
-
-**Proton Type (for GameNative):**
-- `proton-11.0-1-x86_64.wcp` - x86_64 Proton wcp
-- `proton-11.0-1-arm64ec.wcp` - arm64ec Proton wcp
-
-**Wine Type (for Winlator CMOD & Ludashi):**
-- `proton-wine-11.0-1-x86_64.wcp.xz` - x86_64 Wine wcp.xz
-- `proton-wine-11.0-1-arm64ec.wcp.xz` - arm64ec Wine wcp.xz
-
-## Build Scripts Used
-
-The workflow utilizes the following scripts from `build-scripts/`:
-- `build-step0.sh` - Builds wine-tools
-- `build-step-x86_64.sh` - x86_64 build configuration and execution
-- `build-step-arm64ec.sh` - aarch64/ARM64EC build configuration and execution
-
-## Requirements
-
-### External Dependencies
-- **Termuxfs**: Pre-built termux filesystem from GameNative/termux-on-gha
-- **Android NDK**: r27d from Google
-- **LLVM MinGW**: 20250920 release from bylaws/llvm-mingw
-
-### Build Dependencies
-- build-essential
-- git, wget, curl, unzip
-- flex, bison, gettext
-- autoconf, automake, libtool
-- pkg-config
-- mingw-w64
-- gcc-multilib, g++-multilib
-
-## Customization
-
-### Changing Architectures
-Modify the matrix strategy in the workflow:
-```yaml
-strategy:
-  matrix:
-    arch: [x86_64, aarch64]  # Add or remove architectures
-```
-
-### Updating Termuxfs Version
-Change the download URL in the "Download and extract termuxfs" step:
-```yaml
-wget https://github.com/GameNative/termux-on-gha/releases/download/<TAG>/termuxfs-${{ matrix.arch }}.tar.gz
-```
-
-### Modifying Build Configuration
-Edit the corresponding build script in `build-scripts/`:
-- `build-step-x86_64.sh` for x86_64 configuration
-- `build-step-arm64ec.sh` for aarch64 configuration
-
-## Troubleshooting
-
-### Build Failures
-1. Check the build logs in GitHub Actions
-2. Verify termuxfs download is successful
-3. Ensure all patches apply correctly
-4. Check disk space availability
-
-### Cache Issues
-If caching causes problems, you can:
-1. Manually clear caches in GitHub repository settings
-2. Update cache keys in the workflow file
-
-### Release Issues
-Ensure the `GITHUB_TOKEN` has appropriate permissions:
-- Go to repository Settings → Actions → General
-- Set "Workflow permissions" to "Read and write permissions"
+Stamped in the `Generate profile.json` step of each workflow. Every layer
+release bumps it in all seven files; the app installs a higher versionCode as a
+new layer slot alongside the old one.

@@ -393,7 +393,16 @@ static void make_explorer_window(parameters_struct *params)
     CoCreateInstance(&CLSID_ShellWindows, NULL, CLSCTX_LOCAL_SERVER,
             &IID_IShellWindows, (void **)&sw);
 
-    if (params->root[0])
+    if (params->root[0] == ':' && params->root[1] == ':')
+    {
+        /* a shell namespace name like "::{CLSID}\::{CLSID}" (what ShellExecute passes for the
+         * Control Panel or My Computer) is not a file path: GetFullPathName would read it as a
+         * path relative to a drive ':' ("::\{CLSID}...") that the shell can no longer parse */
+        size = wcslen(params->root) + 1;
+        path = malloc( size * sizeof(WCHAR) );
+        memcpy( path, params->root, size * sizeof(WCHAR) );
+    }
+    else if (params->root[0])
     {
         size = GetFullPathNameW(params->root, 0, NULL, NULL);
         path = malloc( size * sizeof(WCHAR) );

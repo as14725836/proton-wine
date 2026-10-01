@@ -40,7 +40,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(explorer);
 #define DESKTOP_CLASS_ATOM ((LPCWSTR)MAKEINTATOM(32769))
 #define DESKTOP_ALL_ACCESS 0x01ff
 
-static const WCHAR default_driver[] = L"mac,x11,wayland";
+static const WCHAR default_driver[] = L"wayland,x11";
 
 static BOOL using_root = TRUE;
 
@@ -337,6 +337,18 @@ static HICON extract_icon( IShellLinkW *link )
         ExpandEnvironmentStringsW( tmp_path, target_path, MAX_PATH );
         ExtractIconExW( target_path, index, &icon, NULL, 1 );
     }
+    return icon;
+}
+
+/* icon of the target of a shortcut file, used by the start menu */
+HICON get_shortcut_icon( const WCHAR *path )
+{
+    IShellLinkW *link = load_shelllink( path );
+    HICON icon;
+
+    if (!link) return NULL;
+    icon = extract_icon( link );
+    IShellLinkW_Release( link );
     return icon;
 }
 
@@ -816,12 +828,15 @@ static LRESULT WINAPI desktop_wnd_proc( HWND hwnd, UINT message, WPARAM wp, LPAR
         return HTCLIENT;
 
     case WM_ERASEBKGND:
-        if (!using_root) PaintDesktop( (HDC)wp );
+        if (!using_root && !paint_xp_wallpaper( hwnd, (HDC)wp )) PaintDesktop( (HDC)wp );
         return TRUE;
 
     case WM_SETTINGCHANGE:
         if (wp == SPI_SETDESKWALLPAPER)
+        {
             SystemParametersInfoW( SPI_SETDESKWALLPAPER, 0, NULL, FALSE );
+            reset_xp_wallpaper();
+        }
         return 0;
 
     case WM_PARENTNOTIFY:
@@ -836,13 +851,17 @@ static LRESULT WINAPI desktop_wnd_proc( HWND hwnd, UINT message, WPARAM wp, LPAR
         }
         return 0;
 
+    case WM_RBUTTONUP:
+        if (!using_root) show_desktop_menu( hwnd, lp );
+        return 0;
+
     case WM_PAINT:
         {
             PAINTSTRUCT ps;
             BeginPaint( hwnd, &ps );
             if (!using_root)
             {
-                PaintDesktop( ps.hdc );
+                if (!paint_xp_wallpaper( hwnd, ps.hdc )) PaintDesktop( ps.hdc );
                 draw_launchers( ps.hdc, ps.rcPaint );
             }
             EndPaint( hwnd, &ps );
