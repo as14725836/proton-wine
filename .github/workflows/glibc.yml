@@ -18,34 +18,104 @@ on:
 
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    # ------------------------------------------------------------
+    # IMPORTANT
+    #
+    # Native Wine/Unix side is glibc AArch64.
+    # Therefore use an ARM64 Ubuntu runner.
+    # ------------------------------------------------------------
+    runs-on: ubuntu-24.04-arm
 
     strategy:
       fail-fast: false
       matrix:
-        arch: [aarch64]
-        api_level: [28]
+        arch:
+          - aarch64
 
     env:
+      # ----------------------------------------------------------
+      # Architecture
+      # ----------------------------------------------------------
       ARCH: aarch64
-      API_LEVEL: 28
-      ANDROID_NDK_VERSION: 27.3.13750724
+      TARGET: aarch64-linux-gnu
+      WIN_ARCH: arm64ec,aarch64,i386
+
+      # ----------------------------------------------------------
+      # Real Termux glibc layout
+      #
+      # Runtime:
+      #
+      # /data/data/com.termux/files/usr/glibc
+      #
+      # This is the official Termux glibc prefix layout.
+      # ----------------------------------------------------------
+      TERMUX_PREFIX: /data/data/com.termux/files/usr
+      GLIBC_PREFIX: /data/data/com.termux/files/usr/glibc
+
+      # CI-side staging root.
+      #
+      # Expected:
+      #
+      # termuxfs/
+      # └── aarch64-glibc/
+      #     └── data/
+      #         └── data/
+      #             └── com.termux/
+      #                 └── files/
+      #                     └── usr/
+      #                         └── glibc/
+      #
+      GLIBC_ROOTFS: ${{ github.workspace }}/termuxfs/aarch64-glibc
+
+      # Termux writable tmp.
+      TERMUX_TMPDIR: /data/data/com.termux/files/usr/tmp
+
+      # ----------------------------------------------------------
+      # LLVM-MinGW
+      # ----------------------------------------------------------
       LLVM_MINGW_VERSION: 20250920
+
+      # ----------------------------------------------------------
+      # Runtime display
+      #
+      # Termux-X11 is primary.
+      # ----------------------------------------------------------
+      DISPLAY: :0
+      GDK_BACKEND: x11
+      XDG_SESSION_TYPE: x11
+
+      # ----------------------------------------------------------
+      # Wine build options
+      # ----------------------------------------------------------
+      ENABLE_WAYLAND: auto
+
+      # Do not build Android-specific helper libraries.
+      BUILD_ANDROID_SYSVSHM: "0"
+      BUILD_NTSYNC_ANDROID: "0"
+
+      # ----------------------------------------------------------
+      # ccache
+      # ----------------------------------------------------------
+      CCACHE_MAXSIZE: 5G
 
     steps:
 
-      # ------------------------------------------------------------
-      # Host build environment
-      # ------------------------------------------------------------
+      # ============================================================
+      # Host
+      # ============================================================
 
       - name: Free up disk space
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+
           df -h
 
       - name: Checkout repository
@@ -54,13 +124,23 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      # ============================================================
+      # Native ARM64 glibc build dependencies
+      # ============================================================
+
       - name: Install build dependencies
         run: |
           sudo dpkg --add-architecture i386
+
           sudo apt-get update
 
           sudo apt-get install -y \
             build-essential \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            libc6-dev \
+            libc6-dev-i386 \
             git \
             wget \
             curl \
@@ -74,94 +154,112 @@ jobs:
             automake \
             libtool \
             pkg-config \
-            mingw-w64 \
-            gcc-multilib \
-            g++-multilib \
             ccache \
+            llvm \
+            clang \
             libwayland-bin \
             libfreetype6-dev \
-            libfreetype6-dev:i386 \
             libpng-dev \
-            libpng-dev:i386 \
             zlib1g-dev \
-            zlib1g-dev:i386 \
             libx11-dev \
-            libx11-dev:i386 \
             libxext-dev \
-            libxext-dev:i386 \
             libxrender-dev \
-            libxrender-dev:i386 \
             libxrandr-dev \
-            libxrandr-dev:i386 \
             libxi-dev \
-            libxi-dev:i386 \
             libxcursor-dev \
-            libxcursor-dev:i386 \
-            libxfixes-dev \
-            libxfixes-dev:i386
+            libxfixes-dev
 
-      # ------------------------------------------------------------
-      # Termux filesystem
-      # ------------------------------------------------------------
+      # ============================================================
+      # Verify host
+      # ============================================================
 
-      - name: Download termuxfs
+      - name: Verify ARM64 glibc host
         run: |
-          mkdir -p "$HOME/termuxfs/${{ matrix.arch }}"
-          cd "$HOME/termuxfs/${{ matrix.arch }}"
+          echo "== uname =="
+          uname -a
 
-          wget \
-            --tries=5 \
-            --retry-connrefused \
-            --waitretry=10 \
-            https://github.com/GameNative/termux-on-gha/releases/download/build-20260218/termuxfs-${{ matrix.arch }}.tar
+          echo
+          echo "== architecture =="
+          uname -m
 
-          tar -xf "termuxfs-${{ matrix.arch }}.tar"
+          echo
+          echo "== native compiler =="
+          cc --version | head -n 2
 
-          echo "TERMUXFS=$HOME/termuxfs/${{ matrix.arch }}" >> "$GITHUB_ENV"
+          echo
+          echo "== cross compiler =="
+          aarch64-linux-gnu-gcc --version | head -n 2
 
-          ls -lah "$HOME/termuxfs/${{ matrix.arch }}"
+          test "$(uname -m)" = "aarch64" || {
+            echo "FATAL: runner is not AArch64"
+            exit 1
+          }
 
-      # ------------------------------------------------------------
-      # Android NDK
-      # ------------------------------------------------------------
+      # ============================================================
+      # Termux glibc rootfs
+      #
+      # IMPORTANT:
+      # This is NOT the old GameNative bionic termuxfs.
+      #
+      # The glibc-build-step-arm64ec.sh expects:
+      #
+      #   $GLIBC_ROOTFS/data/data/com.termux/files/usr/glibc
+      #
+      # ============================================================
 
-      - name: Cache Android NDK
-        id: cache-ndk
-        uses: actions/cache@v4
-        with:
-          path: ~/Android/Sdk/ndk/27.3.13750724
-          key: android-ndk-r27d
-
-      - name: Install Android NDK r27d
-        if: steps.cache-ndk.outputs.cache-hit != 'true'
+      - name: Verify Termux glibc rootfs
         run: |
-          mkdir -p "$HOME/Android/Sdk/ndk"
-          cd "$HOME/Android/Sdk/ndk"
+          DEPS="$GLIBC_ROOTFS/data/data/com.termux/files/usr/glibc"
 
-          wget \
-            --tries=5 \
-            --retry-connrefused \
-            --waitretry=10 \
-            https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          echo "GLIBC_ROOTFS:"
+          echo "$GLIBC_ROOTFS"
 
-          unzip -q android-ndk-r27d-linux.zip
-          mv android-ndk-r27d 27.3.13750724
+          echo
+          echo "GLIBC prefix:"
+          echo "$DEPS"
 
-      - name: Export Android NDK environment
-        run: |
-          echo "ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/27.3.13750724" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=$HOME/Android/Sdk/ndk/27.3.13750724" >> "$GITHUB_ENV"
+          test -d "$DEPS" || {
+            echo
+            echo "FATAL: Termux glibc prefix does not exist:"
+            echo "$DEPS"
+            echo
+            echo "The workflow must provide a real Termux glibc rootfs."
+            exit 1
+          }
 
-      # ------------------------------------------------------------
-      # LLVM MinGW
-      # ------------------------------------------------------------
+          test -d "$DEPS/lib" || {
+            echo "FATAL: missing glibc lib directory"
+            exit 1
+          }
+
+          test -d "$DEPS/include" || {
+            echo "FATAL: missing glibc include directory"
+            exit 1
+          }
+
+          test -d "$DEPS/share" || {
+            echo "FATAL: missing glibc share directory"
+            exit 1
+          }
+
+          echo "DEPS=$DEPS" >> "$GITHUB_ENV"
+
+          echo
+          echo "== glibc prefix =="
+          ls -ld "$DEPS"
+          ls -ld "$DEPS/lib"
+          ls -ld "$DEPS/include"
+
+      # ============================================================
+      # LLVM-MinGW
+      # ============================================================
 
       - name: Cache LLVM MinGW
         id: cache-llvm-mingw
         uses: actions/cache@v4
         with:
           path: ~/toolchains/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
-          key: bylaws-llvm-mingw-20250920
+          key: llvm-mingw-${{ env.LLVM_MINGW_VERSION }}
 
       - name: Install LLVM MinGW
         if: steps.cache-llvm-mingw.outputs.cache-hit != 'true'
@@ -169,21 +267,51 @@ jobs:
           mkdir -p "$HOME/toolchains"
           cd "$HOME/toolchains"
 
+          ARCHIVE="llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-x86_64.tar.xz"
+
           wget \
             --tries=5 \
             --retry-connrefused \
             --waitretry=10 \
-            https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+            "https://github.com/bylaws/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${ARCHIVE}"
 
-          tar -xf llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar -xf "$ARCHIVE"
 
       - name: Export LLVM MinGW
         run: |
-          echo "LLVM_MINGW=$HOME/toolchains/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64" >> "$GITHUB_ENV"
+          LLVM_MINGW_PATH="$HOME/toolchains/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-x86_64"
 
-      # ------------------------------------------------------------
+          test -d "$LLVM_MINGW_PATH" || {
+            echo "FATAL: LLVM-MinGW not found"
+            exit 1
+          }
+
+          echo "LLVM_MINGW=$LLVM_MINGW_PATH" >> "$GITHUB_ENV"
+
+          echo "LLVM MinGW:"
+          echo "$LLVM_MINGW_PATH"
+
+      # ============================================================
+      # Verify LLVM-MinGW
+      # ============================================================
+
+      - name: Verify LLVM MinGW
+        run: |
+          test -x "$LLVM_MINGW/bin/clang" || {
+            echo "FATAL: LLVM-MinGW clang missing"
+            exit 1
+          }
+
+          test -x "$LLVM_MINGW/bin/llvm-dlltool" || {
+            echo "FATAL: LLVM-MinGW llvm-dlltool missing"
+            exit 1
+          }
+
+          "$LLVM_MINGW/bin/clang" --version | head -n 3
+
+      # ============================================================
       # Autoconf / Wine tools
-      # ------------------------------------------------------------
+      # ============================================================
 
       - name: Autogen
         run: |
@@ -194,92 +322,82 @@ jobs:
         uses: actions/cache@v4
         with:
           path: wine-tools
-          key: wine-tools-${{ hashFiles('configure.ac', 'configure') }}
+          key: wine-tools-arm64-glibc-${{ hashFiles('configure.ac', 'configure') }}
 
       - name: Build wine-tools
         if: steps.cache-wine-tools.outputs.cache-hit != 'true'
         run: |
           bash build-scripts/build-step0.sh
 
-      # ------------------------------------------------------------
+      # ============================================================
       # ccache
-      # ------------------------------------------------------------
+      # ============================================================
 
       - name: Configure ccache
         run: |
           mkdir -p "$HOME/.ccache"
 
-          ccache --set-config=max_size=5G
+          ccache --set-config=max_size="$CCACHE_MAXSIZE"
           ccache --set-config=compression=true
           ccache --set-config=compression_level=6
+
+          ccache --zero-stats || true
 
       - name: Restore ccache
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-p11-arm64ec-sdk28-${{ github.sha }}
+          key: ccache-p11-arm64ec-glibc-${{ github.sha }}
           restore-keys: |
-            ccache-p11-arm64ec-sdk28-
+            ccache-p11-arm64ec-glibc-
 
-      # ------------------------------------------------------------
-      # ARM64EC dependencies
-      # ------------------------------------------------------------
-
-      - name: Build sysvshm
-        run: |
-          bash build-scripts/build-step-arm64ec.sh \
-            --build-sysvshm
-
-      # ------------------------------------------------------------
-      # userspace ntsync
-      # ------------------------------------------------------------
-
-      - name: Checkout ntsync-android
-        uses: actions/checkout@v4
-        with:
-          repository: GameNative/ntsync-android
-          ref: 7ce6435e5979b1cb5341aa4b299f31e8937fe121
-          path: _deps/ntsync-android
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android
-
-      - name: Build ntsync-android
-        env:
-          NTSYNC_ANDROID_DIR: ${{ github.workspace }}/_deps/ntsync-android
-        run: |
-          test "$(git -C "$NTSYNC_ANDROID_DIR" rev-parse HEAD)" \
-            = "7ce6435e5979b1cb5341aa4b299f31e8937fe121"
-
-          bash build-scripts/build-step-arm64ec.sh \
-            --build-ntsync-android
-
-      # ------------------------------------------------------------
-      # Configure
-      #
+      # ============================================================
       # IMPORTANT:
-      # SDK 28 + 16KB pages.
       #
-      # X11 remains the primary runtime display path.
-      # Wayland is not required for the Termux-X11 target.
-      # ------------------------------------------------------------
+      # No Android NDK.
+      # No android_sysvshm.
+      # No ntsync-android.
+      #
+      # Native side is:
+      #
+      #   aarch64-linux-gnu
+      #       +
+      #   Termux glibc
+      #
+      # Windows side remains:
+      #
+      #   arm64ec + aarch64 + i386
+      #
+      # ============================================================
 
       - name: Configure ARM64EC Proton
+        env:
+          DEPS: ${{ env.DEPS }}
+          GLIBC_PREFIX: ${{ env.GLIBC_PREFIX }}
+          LLVM_MINGW: ${{ env.LLVM_MINGW }}
+          TARGET: ${{ env.TARGET }}
+          WIN_ARCH: ${{ env.WIN_ARCH }}
+          TERMUX_TMPDIR: ${{ env.TERMUX_TMPDIR }}
+          ENABLE_WAYLAND: ${{ env.ENABLE_WAYLAND }}
         run: |
-          bash build-scripts/build-step-arm64ec.sh \
-            --enable-16kb-pages \
+          bash build-scripts/glibc-build-step-arm64ec.sh \
             --configure
 
-      # ------------------------------------------------------------
+      # ============================================================
       # Build
-      # ------------------------------------------------------------
+      # ============================================================
 
       - name: Build ARM64EC Proton
+        env:
+          DEPS: ${{ env.DEPS }}
+          GLIBC_PREFIX: ${{ env.GLIBC_PREFIX }}
+          LLVM_MINGW: ${{ env.LLVM_MINGW }}
+          TARGET: ${{ env.TARGET }}
+          WIN_ARCH: ${{ env.WIN_ARCH }}
+          TERMUX_TMPDIR: ${{ env.TERMUX_TMPDIR }}
+          ENABLE_WAYLAND: ${{ env.ENABLE_WAYLAND }}
         run: |
-          bash build-scripts/build-step-arm64ec.sh \
-            --enable-16kb-pages \
+          bash build-scripts/glibc-build-step-arm64ec.sh \
             --build
 
       - name: ccache statistics
@@ -287,35 +405,41 @@ jobs:
         run: |
           ccache -s || true
 
-      # ------------------------------------------------------------
+      # ============================================================
       # Install
-      # ------------------------------------------------------------
+      # ============================================================
 
       - name: Install ARM64EC Proton
+        env:
+          DEPS: ${{ env.DEPS }}
+          GLIBC_PREFIX: ${{ env.GLIBC_PREFIX }}
+          LLVM_MINGW: ${{ env.LLVM_MINGW }}
+          TARGET: ${{ env.TARGET }}
+          WIN_ARCH: ${{ env.WIN_ARCH }}
+          TERMUX_TMPDIR: ${{ env.TERMUX_TMPDIR }}
+          ENABLE_WAYLAND: ${{ env.ENABLE_WAYLAND }}
         run: |
-          bash build-scripts/build-step-arm64ec.sh \
-            --enable-16kb-pages \
+          bash build-scripts/glibc-build-step-arm64ec.sh \
             --install
 
-      # ------------------------------------------------------------
-      # Verify ARM64EC + X11
-      # ------------------------------------------------------------
+      # ============================================================
+      # Verify output
+      # ============================================================
 
-      - name: Verify ARM64EC layer
+      - name: Verify output tree
         run: |
           OUTPUT_DIR="$HOME/compiled-files-aarch64"
 
           test -d "$OUTPUT_DIR" || {
-            echo "FATAL: missing $OUTPUT_DIR"
+            echo "FATAL: missing output directory"
             exit 1
           }
 
-          echo "== Output directory =="
+          echo "== Output =="
           du -sh "$OUTPUT_DIR"
 
           echo
-          echo "== ARM64EC Wine binaries =="
-
+          echo "== Tree =="
           find "$OUTPUT_DIR/lib/wine" \
             -maxdepth 2 \
             -type f \
@@ -326,6 +450,55 @@ jobs:
               -o -name 'winewayland.so' \
             \) \
             -print
+
+      # ============================================================
+      # Verify native Wine ELF
+      # ============================================================
+
+      - name: Verify native glibc Wine
+        run: |
+          OUTPUT_DIR="$HOME/compiled-files-aarch64"
+
+          WINE_ELF="$OUTPUT_DIR/lib/wine/aarch64-unix/wine"
+
+          test -f "$WINE_ELF" || {
+            echo "FATAL: Wine native ELF missing:"
+            echo "$WINE_ELF"
+            exit 1
+          }
+
+          echo "== file =="
+          file "$WINE_ELF"
+
+          echo
+          echo "== interpreter =="
+          llvm-readelf -l "$WINE_ELF" |
+            grep 'Requesting program interpreter' || true
+
+          echo
+          echo "== NEEDED =="
+          llvm-readelf -d "$WINE_ELF" |
+            grep NEEDED || true
+
+          echo
+          echo "== Check Android loader =="
+          if llvm-readelf -l "$WINE_ELF" |
+              grep -q 'ld-android'; then
+            echo "FATAL: Android loader detected"
+            exit 1
+          fi
+
+          echo
+          echo "== Check Android native libraries =="
+          if llvm-readelf -d "$WINE_ELF" |
+              grep -Eq 'libandroid|liblog|libnativewindow'; then
+            echo "FATAL: Android-specific native dependency detected"
+            exit 1
+          fi
+
+      # ============================================================
+      # Verify X11
+      # ============================================================
 
       - name: Verify X11 driver
         run: |
@@ -350,15 +523,18 @@ jobs:
             exit 1
           fi
 
-      # ------------------------------------------------------------
-      # Verify Wayland is optional.
+      # ============================================================
+      # Verify Wayland
       #
-      # We do NOT fail the Termux-X11 build if winewayland is absent.
-      # ------------------------------------------------------------
+      # Wayland is optional.
+      # Termux-X11 remains the primary backend.
+      # ============================================================
 
-      - name: Check optional Wayland driver
+      - name: Check optional Wayland
         run: |
           OUTPUT_DIR="$HOME/compiled-files-aarch64"
+
+          FOUND=0
 
           for f in \
             "$OUTPUT_DIR/lib/wine/aarch64-unix/winewayland.so" \
@@ -367,62 +543,125 @@ jobs:
           do
             if [ -f "$f" ]; then
               echo "Wayland available: $f"
-            else
-              echo "Wayland optional file not present: $f"
+              FOUND=1
             fi
           done
 
-      # ------------------------------------------------------------
-      # Verify 16KB ELF alignment
-      # ------------------------------------------------------------
+          if [ "$FOUND" = "0" ]; then
+            echo "Wayland driver not present."
+            echo "This is allowed."
+            echo "X11 is the primary runtime backend."
+          fi
 
-      - name: Verify 16KB ELF alignment
+      # ============================================================
+      # Verify native ELF dependencies
+      # ============================================================
+
+      - name: Verify native ELF dependencies
         run: |
           OUTPUT_DIR="$HOME/compiled-files-aarch64"
 
-          READELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          echo "== Native ELF files =="
 
-          test -x "$READELF" || {
-            echo "FATAL: llvm-readelf not found"
-            exit 1
-          }
-
-          find "$OUTPUT_DIR" \
+          find "$OUTPUT_DIR/lib/wine/aarch64-unix" \
             -type f \
-            -name '*.so' \
             -print0 |
           while IFS= read -r -d '' f; do
-            if file "$f" | grep -q ELF; then
-              echo "Checking $f"
-              "$READELF" -l "$f" 2>/dev/null |
-                grep -E 'LOAD|Align' || true
+            if file "$f" | grep -q 'ELF'; then
+
+              echo
+              echo "---- $f ----"
+
+              llvm-readelf -d "$f" 2>/dev/null |
+                grep NEEDED || true
+
+              if llvm-readelf -d "$f" 2>/dev/null |
+                  grep -Eq 'libandroid|ld-android'; then
+                echo "FATAL: Android dependency found:"
+                echo "$f"
+                exit 1
+              fi
             fi
           done
 
-      # ------------------------------------------------------------
-      # prefixPack
-      # ------------------------------------------------------------
+      # ============================================================
+      # Generate glibc runtime information
+      # ============================================================
 
-      - name: Download prefixPack
+      - name: Generate runtime metadata
         run: |
-          PIN=6286ac456e4a8376e053ce1ce4f565bd37cc4af4
+          OUTPUT_DIR="$HOME/compiled-files-aarch64"
 
-          NAME=prefixPack-arm64ec-11.txz
-          SHA=ade99dc80b17086a269c038c9bc50167902103a9a61df763cba4d613543ff12a
+          cat > "$OUTPUT_DIR/termux-glibc-runtime.txt" <<'EOF'
+          Proton 11.0-1 ARM64EC
+          Target: Termux glibc
+          Architecture: aarch64
+          Native target: aarch64-linux-gnu
 
-          wget \
-            --tries=5 \
-            --retry-connrefused \
-            --waitretry=10 \
-            "https://raw.githubusercontent.com/GameNative/bionic-prefix-files/$PIN/$NAME" \
-            -O "$GITHUB_WORKSPACE/prefixPack.txz"
+          Runtime prefix:
+          /data/data/com.termux/files/usr/glibc
 
-          echo "$SHA  $GITHUB_WORKSPACE/prefixPack.txz" |
-            sha256sum -c -
+          Display:
+          termux-x11
+          DISPLAY=:0
+          GDK_BACKEND=x11
+          XDG_SESSION_TYPE=x11
 
-      # ------------------------------------------------------------
+          Windows targets:
+          arm64ec
+          aarch64
+          i386
+
+          Android NDK:
+          NOT USED
+
+          android_sysvshm:
+          NOT USED
+
+          ntsync-android:
+          NOT USED
+
+          Wayland:
+          OPTIONAL
+          EOF
+
+          cat "$OUTPUT_DIR/termux-glibc-runtime.txt"
+
+      # ============================================================
+      # PrefixPack
+      #
+      # DO NOT download:
+      #
+      # GameNative/bionic-prefix-files
+      #
+      # That package is bionic-oriented.
+      #
+      # A glibc-compatible prefixPack must be supplied separately.
+      # ============================================================
+
+      - name: Verify glibc prefixPack
+        run: |
+          PREFIX_PACK="$GITHUB_WORKSPACE/prefixPack.txz"
+
+          test -f "$PREFIX_PACK" || {
+            echo
+            echo "FATAL: glibc prefixPack.txz is missing."
+            echo
+            echo "Do NOT use:"
+            echo "GameNative/bionic-prefix-files"
+            echo
+            echo "This workflow requires a glibc-compatible prefixPack."
+            exit 1
+          }
+
+          echo "prefixPack:"
+          ls -lh "$PREFIX_PACK"
+
+          file "$PREFIX_PACK"
+
+      # ============================================================
       # Profile
-      # ------------------------------------------------------------
+      # ============================================================
 
       - name: Generate profile.json
         run: |
@@ -431,7 +670,7 @@ jobs:
             "type": "Proton",
             "versionName": "11.0-1-arm64ec-termux-glibc-x11",
             "versionCode": 10,
-            "description": "Proton 11.0-1 ARM64EC for GameNative/Termux glibc. Android SDK28 + 16KB pages. X11 is the primary display backend for termux-x11 (:0). Includes FEX/ARM64EC, userspace ntsync-android and lsteamclient. Wayland remains optional.",
+            "description": "Proton 11.0-1 ARM64EC built for real Termux glibc. Native Unix side targets aarch64-linux-gnu. Termux-X11 is the primary display backend. Wayland is optional. Android NDK, android_sysvshm and ntsync-android are not used.",
             "files": [],
             "wine": {
               "binPath": "bin",
@@ -441,15 +680,21 @@ jobs:
           }
           EOF
 
-          python3 -m json.tool profile.json
+          python3 -m json.tool \
+            "$GITHUB_WORKSPACE/profile.json"
 
-      # ------------------------------------------------------------
+      # ============================================================
       # Package
-      # ------------------------------------------------------------
+      # ============================================================
 
       - name: Package Proton WCP
         run: |
           OUTPUT_DIR="$HOME/compiled-files-aarch64"
+
+          test -f "$GITHUB_WORKSPACE/prefixPack.txz" || {
+            echo "FATAL: prefixPack.txz missing"
+            exit 1
+          }
 
           cd "$OUTPUT_DIR"
 
@@ -458,24 +703,28 @@ jobs:
 
           tar \
             -I 'zstd -T0 -19' \
-            -cf "$GITHUB_WORKSPACE/proton-11.0-1-arm64ec-termux-x11.wcp" \
+            -cf "$GITHUB_WORKSPACE/proton-11.0-1-arm64ec-termux-glibc-x11.wcp" \
             bin \
             lib \
             share \
             prefixPack.txz \
-            profile.json
+            profile.json \
+            termux-glibc-runtime.txt
 
-      # ------------------------------------------------------------
+      # ============================================================
       # Verify WCP
-      # ------------------------------------------------------------
+      # ============================================================
 
       - name: Verify WCP
         run: |
           cd "$GITHUB_WORKSPACE"
 
-          WCP="proton-11.0-1-arm64ec-termux-x11.wcp"
+          WCP="proton-11.0-1-arm64ec-termux-glibc-x11.wcp"
 
-          test -f "$WCP"
+          test -f "$WCP" || {
+            echo "FATAL: WCP missing"
+            exit 1
+          }
 
           tar -I zstd -tf "$WCP" > wcp.lst
 
@@ -483,15 +732,20 @@ jobs:
             profile.json \
             prefixPack.txz \
             bin/wine \
-            share/wine/wine.inf
+            share/wine/wine.inf \
+            termux-glibc-runtime.txt
           do
             grep -qx -- "$e" wcp.lst || {
-              echo "FATAL: $e missing"
+              echo "FATAL: $e missing from WCP"
               exit 1
             }
           done
 
-          tar -I zstd -xf "$WCP" -O profile.json > wcp-profile.json
+          tar \
+            -I zstd \
+            -xf "$WCP" \
+            -O profile.json \
+            > wcp-profile.json
 
           cmp \
             wcp-profile.json \
@@ -499,7 +753,10 @@ jobs:
 
           python3 -c '
           import json
-          p=json.load(open("wcp-profile.json"))
+
+          with open("wcp-profile.json") as f:
+              p = json.load(f)
+
           print("type:", p["type"])
           print("versionName:", p["versionName"])
           print("versionCode:", p["versionCode"])
@@ -509,16 +766,17 @@ jobs:
           echo "WCP size:"
           stat -c '%s bytes' "$WCP"
 
-      # ------------------------------------------------------------
+      # ============================================================
       # lsteamclient
-      # ------------------------------------------------------------
+      # ============================================================
 
       - name: Verify lsteamclient
         run: |
           cd "$GITHUB_WORKSPACE"
 
-          tar -I zstd -tf \
-            proton-11.0-1-arm64ec-termux-x11.wcp \
+          tar \
+            -I zstd \
+            -tf proton-11.0-1-arm64ec-termux-glibc-x11.wcp \
             > wcp.lst
 
           for e in \
@@ -534,20 +792,24 @@ jobs:
             echo "OK: $e"
           done
 
-      # ------------------------------------------------------------
-      # Upload
-      # ------------------------------------------------------------
+      # ============================================================
+      # Upload WCP
+      # ============================================================
 
       - name: Upload Proton ARM64EC WCP
         uses: actions/upload-artifact@v4
         with:
-          name: proton-11.0-1-arm64ec-termux-x11-sdk28
-          path: proton-11.0-1-arm64ec-termux-x11.wcp
+          name: proton-11.0-1-arm64ec-termux-glibc-x11
+          path: proton-11.0-1-arm64ec-termux-glibc-x11.wcp
           retention-days: 30
+
+      # ============================================================
+      # Upload installed tree
+      # ============================================================
 
       - name: Upload installed Proton tree
         uses: actions/upload-artifact@v4
         with:
-          name: proton-11.0-1-arm64ec-termux-x11-tree
+          name: proton-11.0-1-arm64ec-termux-glibc-x11-tree
           path: ${{ env.HOME }}/compiled-files-aarch64
           retention-days: 7
