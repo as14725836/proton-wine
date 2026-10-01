@@ -107,7 +107,6 @@ jobs:
           sudo rm -rf /usr/share/dotnet || true
           sudo rm -rf /opt/ghc || true
           sudo rm -rf /usr/local/share/boost || true
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
 
           df -h
 
@@ -332,18 +331,20 @@ jobs:
 
           bash build-scripts/build-step0-autogen.sh
 
+      # ==========================================================
+      # Cache wine-tools
+      #
+      # NOTE:
+      # hashFiles() must be on a SINGLE line inside ${{ }}.
+      # A multi-line hashFiles() breaks YAML parsing.
+      # ==========================================================
+
       - name: Cache wine-tools
         id: cache-wine-tools
         uses: actions/cache@v4
         with:
           path: wine-tools
-          key: wine-tools-arm64-glibc-${{ hashFiles(
-            'configure.ac',
-            'configure',
-            'Makefile.in',
-            'build-scripts/build-step0.sh',
-            'build-scripts/build-step0-autogen.sh'
-          ) }}
+          key: wine-tools-arm64-glibc-${{ hashFiles('configure.ac', 'configure', 'Makefile.in', 'build-scripts/build-step0.sh', 'build-scripts/build-step0-autogen.sh') }}
 
       - name: Build wine-tools
         if: steps.cache-wine-tools.outputs.cache-hit != 'true'
